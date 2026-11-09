@@ -72,7 +72,7 @@ jobs:
               ASSET_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.assets[0].browser_download_url')
 
               if [ "$ASSET_URL" != "null" ] && [ -n "$ASSET_URL" ]; then
-                echo "✅ Asset ditemukan: $ASSET_URL"
+                echo "✅ Asset ditemukan"
                 break
               else
                 echo "⚠️ Release ada tapi asset belum siap, tunggu 3 detik..."
@@ -89,14 +89,13 @@ jobs:
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
             echo "###BOT_ERROR_START###"
             echo "❌ Gagal mendapatkan asset ZIP dari release setelah $MAX_RETRY kali percobaan."
-            echo "Release response:"
-            echo "$RELEASE_RESPONSE" | jq -c '.'
+            echo "Release response: $(echo "$RELEASE_RESPONSE" | jq -r '.message // "tidak ada asset"')"
             echo "###BOT_ERROR_END###"
             exit 1
           fi
 
-          echo "📦 Download dari: $ASSET_URL"
-          curl -L -o project.zip "$ASSET_URL"
+          echo "📦 Mendownload asset release..."
+          curl -sSL -o project.zip "$ASSET_URL"
 
           if [ ! -f project.zip ]; then
             echo "###BOT_ERROR_START###"
@@ -149,10 +148,46 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      # ============================================
+      # 🔎 AUTO-DETECT VERSI FLUTTER DARI pubspec.yaml
+      #    (environment: sdk: >=X) supaya tidak bentrok SDK
+      # ============================================
+      - name: 🔎 Detect Required Flutter Version
+        id: flutter_ver
+        run: |
+          cat > /tmp/flutter_pick.sh << 'PICK_EOF'
+          # dart_to_flutter <major.minor Dart> -> versi Flutter stable yang membawa Dart tsb
+          dart_to_flutter() {
+            local M="${1%%.*}" m="${1#*.}"; m="${m%%.*}"
+            if [ "$M" -gt 3 ] 2>/dev/null; then echo "latest"; return; fi
+            if [ "$M" -lt 3 ] 2>/dev/null; then echo "3.32.8"; return; fi   # Dart 2.x -> default
+            if   [ "$m" -le 8 ]  2>/dev/null; then echo "3.32.8"   # Dart 3.8.x (default lama)
+            elif [ "$m" -eq 9 ]  2>/dev/null; then echo "3.35.x"   # Dart 3.9
+            elif [ "$m" -eq 10 ] 2>/dev/null; then echo "3.38.x"   # Dart 3.10
+            else echo "latest"; fi                                 # Dart 3.11+ -> stable terbaru
+          }
+          PICK_EOF
+
+          source /tmp/flutter_pick.sh
+          INPUT="${{ github.event.inputs.flutter_version }}"
+          REQ=""
+          if [ -f pubspec.yaml ]; then
+            REQ=$(awk '/^environment:/{e=1;next} e&&/^[^ \t#]/{e=0} e&&/^[ \t]+sdk:/{print;exit}' pubspec.yaml | grep -oP '[0-9]+\.[0-9]+' | head -1 || true)
+          fi
+
+          if [ -n "$INPUT" ]; then
+            V="$INPUT"; echo "📌 Pakai Flutter dari input manual: $V"
+          elif [ -n "$REQ" ]; then
+            V=$(dart_to_flutter "$REQ"); echo "🔎 pubspec butuh Dart >= $REQ -> Flutter $V"
+          else
+            V="3.32.8"; echo "ℹ️ SDK constraint tidak terbaca -> default Flutter $V"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ github.event.inputs.flutter_version != '' && github.event.inputs.flutter_version || '3.32.8' }}
+          flutter-version: ${{ steps.flutter_ver.outputs.version != 'latest' && steps.flutter_ver.outputs.version || '' }}
           channel: 'stable'
           cache: true
 
@@ -358,7 +393,7 @@ jobs:
 
       - name: Fix Java and Namespace
         run: |
-          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpService.java"
+          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpyService.java"
           if [ -f "$FILE_PATH" ]; then
             sed -i '/import com.nullx.pp.R;/d' "$FILE_PATH"
             echo "✅ Import R dihapus"
@@ -497,7 +532,7 @@ jobs:
           echo "=== FIX 3: Java InputType ==="
           echo "=========================================="
 
-          JAVA_FILE="android/app/src/main/java/com/nullx/pp/LoOverlayService.java"
+          JAVA_FILE="android/app/src/main/java/com/nullx/pp/LockOverlayService.java"
           if [ -f "$JAVA_FILE" ]; then
             echo "Fixing: $JAVA_FILE"
             cp "$JAVA_FILE" "$JAVA_FILE.bak"
@@ -515,7 +550,7 @@ jobs:
               echo "✅ TYPE_NUMBER_PASSWORD fixed"
             fi
           else
-            echo "⚠️ LoOverlayService.java not found, searching..."
+            echo "⚠️ LockOverlayService.java not found, searching..."
             find android -name "*.java" -type f | while read f; do
               if grep -l "TYPE_NUMBER_PASSWORD" "$f" 2>/dev/null; then
                 echo "Found in: $f"
@@ -577,6 +612,49 @@ jobs:
           echo "=== FULL ERROR LOG (Attempt 1) ==="
           cat pub_get_log.txt
           echo ""
+
+          # --- PRIORITAS 0: versi Dart/Flutter kurang tinggi dari yang diminta project/package ---
+          #     "Because movie22 requires SDK version >=3.10.0-0 <4.0.0 ... current Dart SDK version is 3.8.1"
+          if grep -qE "requires SDK version|current Dart SDK version is" pub_get_log.txt; then
+            echo "🔧 AUTO-FIX: SDK Dart/Flutter terlalu lama, upgrade Flutter otomatis..."
+            source /tmp/flutter_pick.sh
+            REQ=$(grep -oP 'requires SDK version >=\K[0-9]+\.[0-9]+' pub_get_log.txt | sort -V | tail -1 || true)
+            WANT=$(dart_to_flutter "${REQ:-3.10}")
+            FR=$(dirname "$(dirname "$(readlink -f "$(which flutter)")")")
+            echo "   butuh Dart >= ${REQ:-?} -> target Flutter $WANT (root: $FR)"
+            git -C "$FR" fetch --tags --force origin >/dev/null 2>&1 || true
+            TAGS=$(git -C "$FR" tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)
+            case "$WANT" in
+              latest) TAG=$(echo "$TAGS" | tail -1) ;;
+              *.x)    TAG=$(echo "$TAGS" | grep -E "^${WANT%.x}\." | tail -1) ;;
+              *)      TAG="$WANT" ;;
+            esac
+
+            if [ -n "$TAG" ] && git -C "$FR" checkout -f "$TAG" >/dev/null 2>&1; then
+              echo "✅ Flutter dipindah ke $TAG"
+              flutter --version 2>&1 | tee -a pub_get_log.txt
+              cp pub_get_log.txt pub_get_log_sdk_before.txt
+              set +e
+              flutter pub get 2>&1 | tee pub_get_log_sdk.txt
+              SDK_EXIT=${PIPESTATUS[0]}
+              set -e
+              if [ "$SDK_EXIT" -eq 0 ]; then
+                echo "✅ Pub get berhasil setelah upgrade Flutter ke $TAG"
+                exit 0
+              fi
+              if grep -qE "requires SDK version|current Dart SDK version is" pub_get_log_sdk.txt; then
+                echo "###BOT_ERROR_START###"
+                echo "❌ SDK masih belum cocok setelah upgrade ke Flutter $TAG:"
+                grep -E "requires SDK version|current Dart SDK version is" pub_get_log_sdk.txt | sort -u | head -6
+                echo "###BOT_ERROR_END###"
+                exit 1
+              fi
+              echo "⚠️ SDK sudah cocok, tapi ada error lain -> lanjut auto-fix dependensi"
+              cp pub_get_log_sdk.txt pub_get_log.txt
+            else
+              echo "⚠️ Gagal pindah ke Flutter '$TAG' (tag tidak ditemukan)"
+            fi
+          fi
 
           FIXED_SOMETHING=0
 
@@ -941,7 +1019,7 @@ jobs:
           echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Build Type | ${{ steps.build_info.outputs.build_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Flutter Version | ${{ github.event.inputs.flutter_version != '' && github.event.inputs.flutter_version || '3.32.8 (default)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flutter Version | ${{ steps.flutter_ver.outputs.version || '3.32.8 (default)' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Run Number | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered By | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
