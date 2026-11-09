@@ -676,63 +676,203 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
+      - name: 🛠️ Prepare Auto-Fix Helper
+        run: |
+          cat > /tmp/autofix.sh << 'AUTOFIX_EOF'
+          #!/usr/bin/env bash
+          # ===== AUTO-FIX HELPER (di-source oleh step build) =====
+          EXTRA=()          # flag tambahan untuk flutter build (mis. --no-shrink)
+          APPLIED=()        # daftar fix yang sudah diterapkan
+          GP="android/gradle.properties"
+
+          _applied() { local k="$1"; for a in "${APPLIED[@]:-}"; do [ "$a" = "$k" ] && return 0; done; return 1; }
+          _mark()    { APPLIED+=("$1"); echo "  🔧 AUTO-FIX: $2"; }
+          _gradle_files() { find android -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null; }
+          _plugin_gradles() { find "${PUB_CACHE:-$HOME/.pub-cache}/hosted" -path "*/android/build.gradle*" -type f 2>/dev/null; }
+          _set_compile() {   # $1 = versi, edit project + plugin pub-cache
+            local v="$1" f
+            for f in $(_gradle_files) $(_plugin_gradles); do
+              sed -i -E "s/compileSdkVersion\s*=?\s*[0-9]+/compileSdkVersion $v/g; s/compileSdk\s*=\s*[0-9]+/compileSdk = $v/g; s/compileSdk\s+[0-9]+/compileSdk $v/g; s/compileSdk\([0-9]+\)/compileSdk($v)/g" "$f" 2>/dev/null || true
+            done
+          }
+          _set_minsdk() {    # $1 = versi
+            local v="$1" f
+            for f in $(_gradle_files); do
+              sed -i -E "s/minSdkVersion\s+flutter\.minSdkVersion/minSdkVersion $v/g; s/minSdkVersion\s*=?\s*[0-9]+/minSdkVersion $v/g; s/minSdk\s*=\s*(flutter\.minSdkVersion|[0-9]+)/minSdk = $v/g; s/minSdk\((flutter\.minSdkVersion|[0-9]+)\)/minSdk($v)/g; s/minSdk\s+[0-9]+/minSdk $v/g" "$f" 2>/dev/null || true
+            done
+          }
+          _gp_set() {        # $1 = key, $2 = value
+            mkdir -p android; touch "$GP"
+            if grep -q "^$1=" "$GP"; then sed -i "s|^$1=.*|$1=$2|" "$GP"; else echo "$1=$2" >> "$GP"; fi
+          }
+
+          # return 0 = ada perubahan / layak di-retry, 1 = tidak ada yang bisa di-fix
+          apply_autofix() {
+            local LOG="$1" CHANGED=1 n
+
+            # 1) Plugin lama tanpa namespace (AGP 8+)
+            if grep -qiE "Namespace not specified|namespace.*(is not|isn't) (specified|set)" "$LOG" && ! _applied namespace; then
+              local cnt=0 f pkg
+              for f in $(_plugin_gradles); do
+                grep -q "namespace" "$f" && continue
+                local mf; mf="$(dirname "$f")/src/main/AndroidManifest.xml"
+                [ -f "$mf" ] || continue
+                pkg=$(grep -oP 'package="\K[^"]+' "$mf" | head -1)
+                [ -n "$pkg" ] || continue
+                sed -i -E "0,/android\s*\{/s//android {\n    namespace \"$pkg\"/" "$f" && cnt=$((cnt+1))
+              done
+              _mark namespace "namespace ditambahkan ke $cnt plugin lama"; CHANGED=0
+            fi
+
+            # 2) compileSdk terlalu rendah
+            n=$(grep -oP "compile against version \K[0-9]+" "$LOG" | sort -n | tail -1)
+            if [ -z "$n" ]; then n=$(grep -oP "requires Android SDK version \K[0-9]+" "$LOG" | sort -n | tail -1); fi
+            if [ -n "$n" ] && ! _applied "compileSdk$n"; then
+              [ "$n" -lt 36 ] && n=36
+              _set_compile "$n"; _mark "compileSdk$n" "compileSdk -> $n"; CHANGED=0
+            elif grep -qE "android:attr/(lStar|foreground)|resource android:attr.*not found" "$LOG" && ! _applied compileSdkAttr; then
+              _set_compile 36; _mark compileSdkAttr "compileSdk -> 36 (resource attr not found)"; CHANGED=0
+            fi
+
+            # 3) minSdk lebih kecil dari yang diminta library
+            n=$(grep -oP "minSdkVersion [0-9]+ cannot be smaller than version \K[0-9]+" "$LOG" | sort -n | tail -1)
+            if [ -n "$n" ] && ! _applied "minSdk$n"; then
+              _set_minsdk "$n"; _mark "minSdk$n" "minSdk -> $n"; CHANGED=0
+            fi
+
+            # 4) Kotlin metadata / versi tidak cocok
+            if grep -qiE "incompatible version of Kotlin|binary version of its metadata|Kotlin Gradle plugin.*(not|older)|Unsupported Kotlin" "$LOG" && ! _applied kotlin; then
+              for f in android/build.gradle android/build.gradle.kts; do
+                [ -f "$f" ] && sed -i -E "s/ext\.kotlin_version\s*=\s*['\"][^'\"]*['\"]/ext.kotlin_version = '2.1.0'/; s/(kotlin_version\s*=\s*)['\"][^'\"]*['\"]/\1'2.1.0'/" "$f"
+              done
+              for f in android/settings.gradle android/settings.gradle.kts; do
+                [ -f "$f" ] && sed -i -E "s/(org\.jetbrains\.kotlin\.android[\"'][^\"']*version[\"' ]+)[\"'][0-9.]+[\"']/\1\"2.1.0\"/" "$f"
+              done
+              _mark kotlin "Kotlin -> 2.1.0"; CHANGED=0
+            fi
+
+            # 5) JVM target mismatch Java vs Kotlin
+            if grep -qiE "Inconsistent JVM-target compatibility|jvmTarget" "$LOG" && ! _applied jvm; then
+              _gp_set kotlin.jvm.target.validation.mode IGNORE
+              _mark jvm "kotlin.jvm.target.validation.mode=IGNORE"; CHANGED=0
+            fi
+
+            # 6) R8 / minify: class hilang
+            if grep -qiE "Missing classes detected while running R8|R8: |minifyReleaseWithR8" "$LOG" && ! _applied r8; then
+              EXTRA+=(--no-shrink)
+              _mark r8 "build ulang dengan --no-shrink (R8 error)"; CHANGED=0
+            fi
+
+            # 7) Out of memory
+            if grep -qiE "Java heap space|GC overhead|OutOfMemoryError|Metaspace|Daemon will be stopped|Expiring Daemon" "$LOG" && ! _applied oom; then
+              _gp_set org.gradle.jvmargs "-Xmx5g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError"
+              _mark oom "Gradle heap -> 5g"; CHANGED=0
+            fi
+
+            # 8) Asset hilang
+            local assets; assets=$(grep -oP "(No file or variants found for asset: |unable to find directory entry in pubspec.yaml: )\K\S+" "$LOG" | tr -d "'\"." | sort -u)
+            if [ -n "$assets" ] && ! _applied assets; then
+              for a in $assets; do
+                a="${a%.}"
+                case "$a" in */) mkdir -p "$a"; touch "$a/.gitkeep" ;; *) mkdir -p "$(dirname "$a")"; touch "$a" ;; esac
+                echo "    + placeholder: $a"
+              done
+              _mark assets "asset hilang dibuatkan placeholder"; CHANGED=0
+            fi
+
+            # 9) Lisensi SDK / NDK rusak / build-tools
+            if grep -qiE "licenses? (have|has) not been accepted|Failed to install the following Android SDK packages" "$LOG" && ! _applied licenses; then
+              yes | flutter doctor --android-licenses >/dev/null 2>&1 || true
+              yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+              _mark licenses "lisensi Android SDK diterima"; CHANGED=0
+            fi
+            if grep -qiE "NDK .*(did not have a source.properties|is not installed|corrupt)|\[CXX1101\]" "$LOG" && ! _applied ndk; then
+              for d in "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/ndk/*; do [ -d "$d" ] && [ ! -f "$d/source.properties" ] && rm -rf "$d"; done
+              _mark ndk "NDK rusak dibersihkan"; CHANGED=0
+            fi
+
+            # 10) Gangguan jaringan -> cukup retry
+            if grep -qiE "Could not (resolve|download|GET)|Read timed out|Connection (reset|timed out|refused)|Premature end of Content-Length|Received fatal alert|Could not HEAD" "$LOG" && ! _applied "net$3"; then
+              _mark "net$3" "gangguan jaringan -> retry"; sleep 10; CHANGED=0
+            fi
+
+            # 11) Fallback terakhir: clean total (sekali)
+            if [ "$CHANGED" -ne 0 ] && ! _applied clean; then
+              echo "  ⚠️ Pola error tidak dikenal -> flutter clean + hapus cache Gradle, lalu coba lagi"
+              flutter clean >/dev/null 2>&1 || true
+              rm -rf android/.gradle android/build build "$HOME/.gradle/caches/transforms-"* 2>/dev/null || true
+              flutter pub get >/dev/null 2>&1 || true
+              _mark clean "clean build"; CHANGED=0
+            fi
+            return $CHANGED
+          }
+
+          # pemakaian: build_with_autofix <perintah flutter build ...>
+          build_with_autofix() {
+            local MAX=6 attempt EXIT
+            for attempt in $(seq 1 $MAX); do
+              echo "=========================================="
+              echo "=== BUILD attempt $attempt/$MAX ${EXTRA[*]:-} ==="
+              echo "=========================================="
+              set +e
+              "$@" "${EXTRA[@]}" 2>&1 | tee build_log.txt
+              EXIT=${PIPESTATUS[0]}
+              set -e
+              [ "$EXIT" -eq 0 ] && { [ ${#APPLIED[@]} -gt 0 ] && echo "✅ Berhasil setelah auto-fix: ${APPLIED[*]}"; return 0; }
+              [ "$attempt" -lt "$MAX" ] || break
+              echo ""
+              echo "🛠️ Build gagal, mencoba auto-fix (attempt $attempt)..."
+              cp build_log.txt "build_log_attempt_$attempt.txt"
+              if ! apply_autofix build_log.txt x "$attempt"; then echo "❌ Tidak ada auto-fix yang cocok"; break; fi
+              echo "🔄 Mengulang build setelah auto-fix..."
+            done
+            return 1
+          }
+
+          AUTOFIX_EOF
+          bash -n /tmp/autofix.sh && echo "✅ Auto-fix helper siap"
+
       - name: Build APK Debug
         if: steps.build_info.outputs.build_type == 'apk-debug'
         run: |
-          set +e
-          flutter build apk --debug \
-            --no-shrink \
-            --target-platform android-arm,android-arm64,android-x64 2>&1 | tee build_log.txt
-          BUILD_EXIT=${PIPESTATUS[0]}
-          set -e
-          if [ "$BUILD_EXIT" -ne 0 ]; then
+          source /tmp/autofix.sh
+          if ! build_with_autofix flutter build apk --debug --no-shrink --target-platform android-arm,android-arm64,android-x64; then
             echo "###BOT_ERROR_START###"
-            echo "❌ Build APK Debug gagal."
+            echo "❌ Build APK Debug gagal (sudah dicoba auto-fix: ${APPLIED[*]:-tidak ada fix yang cocok})."
             echo ""
-            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED" build_log.txt | sort -u || tail -30 build_log.txt
+            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED|What went wrong|Could not|not found" build_log.txt | sort -u | tail -25 || tail -30 build_log.txt
             echo "###BOT_ERROR_END###"
             exit 1
           fi
-          echo "✅ APK Debug selesai"
+          echo "✅ Build APK Debug selesai"
 
       - name: Build APK Release
         if: steps.build_info.outputs.build_type == 'apk-release'
         run: |
-          set +e
-          flutter build apk --release \
-            --obfuscate \
-            --split-debug-info=build/debug-info \
-            --target-platform android-arm,android-arm64,android-x64 2>&1 | tee build_log.txt
-          BUILD_EXIT=${PIPESTATUS[0]}
-          set -e
-          if [ "$BUILD_EXIT" -ne 0 ]; then
+          source /tmp/autofix.sh
+          if ! build_with_autofix flutter build apk --release --obfuscate --split-debug-info=build/debug-info --target-platform android-arm,android-arm64,android-x64; then
             echo "###BOT_ERROR_START###"
-            echo "❌ Build APK Release gagal."
+            echo "❌ Build APK Release gagal (sudah dicoba auto-fix: ${APPLIED[*]:-tidak ada fix yang cocok})."
             echo ""
-            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED" build_log.txt | sort -u || tail -30 build_log.txt
+            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED|What went wrong|Could not|not found" build_log.txt | sort -u | tail -25 || tail -30 build_log.txt
             echo "###BOT_ERROR_END###"
             exit 1
           fi
-          echo "✅ APK Release selesai"
+          echo "✅ Build APK Release selesai"
 
       - name: Build AAB Release
         if: steps.build_info.outputs.build_type == 'aab-release'
         run: |
-          set +e
-          flutter build appbundle --release \
-            --obfuscate \
-            --split-debug-info=build/debug-info 2>&1 | tee build_log.txt
-          BUILD_EXIT=${PIPESTATUS[0]}
-          set -e
-          if [ "$BUILD_EXIT" -ne 0 ]; then
+          source /tmp/autofix.sh
+          if ! build_with_autofix flutter build appbundle --release --obfuscate --split-debug-info=build/debug-info; then
             echo "###BOT_ERROR_START###"
-            echo "❌ Build AAB Release gagal."
+            echo "❌ Build AAB Release gagal (sudah dicoba auto-fix: ${APPLIED[*]:-tidak ada fix yang cocok})."
             echo ""
-            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED" build_log.txt | sort -u || tail -30 build_log.txt
+            grep -E "Error:|error:|FAILURE|Exception|Execution failed|BUILD FAILED|What went wrong|Could not|not found" build_log.txt | sort -u | tail -25 || tail -30 build_log.txt
             echo "###BOT_ERROR_END###"
             exit 1
           fi
-          echo "✅ AAB Release selesai"
+          echo "✅ Build AAB Release selesai"
 
       - name: Upload Build Error Log
         if: failure()
