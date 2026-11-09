@@ -51,10 +51,10 @@ jobs:
         run: |
           echo "📥 Mendownload project dari release: ${{ github.event.inputs.release_tag }}"
 
-          echo "⏳ Menunggu 15 detik untuk memastikan release siap..."
-          sleep 15
+          echo "⏳ Menunggu 2 detik..."
+          sleep 2
 
-          MAX_RETRY=5
+          MAX_RETRY=12
           RETRY=0
           ASSET_URL=""
 
@@ -75,12 +75,12 @@ jobs:
                 echo "✅ Asset ditemukan: $ASSET_URL"
                 break
               else
-                echo "⚠️ Release ada tapi asset belum siap, tunggu 10 detik..."
-                sleep 10
+                echo "⚠️ Release ada tapi asset belum siap, tunggu 3 detik..."
+                sleep 3
               fi
             else
-              echo "⚠️ Release belum ditemukan, tunggu 10 detik..."
-              sleep 10
+              echo "⚠️ Release belum ditemukan, tunggu 3 detik..."
+              sleep 3
             fi
 
             RETRY=$((RETRY+1))
@@ -358,7 +358,7 @@ jobs:
 
       - name: Fix Java and Namespace
         run: |
-          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpyService.java"
+          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpService.java"
           if [ -f "$FILE_PATH" ]; then
             sed -i '/import com.nullx.pp.R;/d' "$FILE_PATH"
             echo "✅ Import R dihapus"
@@ -497,7 +497,7 @@ jobs:
           echo "=== FIX 3: Java InputType ==="
           echo "=========================================="
 
-          JAVA_FILE="android/app/src/main/java/com/nullx/pp/LockOverlayService.java"
+          JAVA_FILE="android/app/src/main/java/com/nullx/pp/LoOverlayService.java"
           if [ -f "$JAVA_FILE" ]; then
             echo "Fixing: $JAVA_FILE"
             cp "$JAVA_FILE" "$JAVA_FILE.bak"
@@ -515,7 +515,7 @@ jobs:
               echo "✅ TYPE_NUMBER_PASSWORD fixed"
             fi
           else
-            echo "⚠️ LockOverlayService.java not found, searching..."
+            echo "⚠️ LoOverlayService.java not found, searching..."
             find android -name "*.java" -type f | while read f; do
               if grep -l "TYPE_NUMBER_PASSWORD" "$f" 2>/dev/null; then
                 echo "Found in: $f"
@@ -675,6 +675,26 @@ jobs:
             pub_get_log_retry.txt
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: 🗜️ Optimize Assets (kecilkan ukuran APK)
+        if: steps.build_info.outputs.build_type != 'apk-debug'
+        continue-on-error: true
+        run: |
+          echo "=== OPTIMIZE ASSETS ==="
+          sudo apt-get install -y -qq optipng jpegoptim >/dev/null 2>&1 || echo "⚠️ optipng/jpegoptim gagal dipasang, dilewati"
+          DIRS=""
+          for d in assets android/app/src/main/res; do [ -d "$d" ] && DIRS="$DIRS $d"; done
+          if [ -n "$DIRS" ]; then
+            BEFORE=$(du -sk $DIRS | awk '{s+=$1} END{print s}')
+            if command -v optipng >/dev/null 2>&1; then
+              find $DIRS -type f -iname "*.png" ! -name "*.9.png" ! -name "ic_launcher*" -size +20k -print0 | xargs -0 -r -P4 -n1 optipng -quiet -o2 -strip all || true
+            fi
+            if command -v jpegoptim >/dev/null 2>&1; then
+              find $DIRS -type f \( -iname "*.jpg" -o -iname "*.jpeg" \) -size +30k -print0 | xargs -0 -r -P4 -n1 jpegoptim --strip-all -m85 -q || true
+            fi
+            AFTER=$(du -sk $DIRS | awk '{s+=$1} END{print s}')
+            echo "📉 Aset: ${BEFORE}KB -> ${AFTER}KB"
+          fi
 
       - name: 🛠️ Prepare Auto-Fix Helper
         run: |
@@ -850,7 +870,7 @@ jobs:
         if: steps.build_info.outputs.build_type == 'apk-release'
         run: |
           source /tmp/autofix.sh
-          if ! build_with_autofix flutter build apk --release --obfuscate --split-debug-info=build/debug-info --target-platform android-arm,android-arm64,android-x64; then
+          if ! build_with_autofix flutter build apk --release --obfuscate --split-debug-info=build/debug-info --target-platform android-arm64 --tree-shake-icons; then
             echo "###BOT_ERROR_START###"
             echo "❌ Build APK Release gagal (sudah dicoba auto-fix: ${APPLIED[*]:-tidak ada fix yang cocok})."
             echo ""
@@ -910,6 +930,7 @@ jobs:
           name: flutter-build-${{ steps.build_info.outputs.build_type }}-${{ github.run_number }}
           path: output/
           retention-days: 3
+          compression-level: 0
           if-no-files-found: error
 
       - name: Build Summary
