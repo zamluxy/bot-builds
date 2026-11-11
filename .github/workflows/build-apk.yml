@@ -193,17 +193,36 @@ jobs:
 
       # ============================================
       # 🎨 REGENERATE LAUNCHER ICONS (FIX UTAMA)
+      #    apt dibatasi timeout supaya tidak hang
+      #    kalau mirror Azure bermasalah
       # ============================================
       - name: 🎨 Regenerate Launcher Icons
+        timeout-minutes: 5
         run: |
           echo "=========================================="
           echo "=== REGENERATING LAUNCHER ICONS ==="
           echo "=========================================="
 
-          if ! command -v convert >/dev/null 2>&1; then
-            echo "📦 Installing ImageMagick..."
-            sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+          IM=""
+          if command -v magick >/dev/null 2>&1; then IM="magick"
+          elif command -v convert >/dev/null 2>&1; then IM="convert"
+          else
+            echo "📦 Installing ImageMagick (dengan timeout)..."
+            sudo timeout 60 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update -qq || true
+            sudo timeout 120 apt-get install -y -qq imagemagick || true
+            if command -v magick >/dev/null 2>&1; then IM="magick"
+            elif command -v convert >/dev/null 2>&1; then IM="convert"
+            else
+              echo "###BOT_ERROR_START###"
+              echo "❌ ImageMagick gagal dipasang (mirror apt bermasalah). Coba jalankan ulang build."
+              echo "###BOT_ERROR_END###"
+              exit 1
+            fi
           fi
+          echo "✅ Pakai: $IM"
+
+          # semua pemanggilan `convert` di bawah otomatis pakai binary yang ada
+          if [ "$IM" = "magick" ]; then convert() { magick "$@"; }; fi
 
           SOURCE_ICON=""
           if [ -f "assets/icon/icon.jpg" ]; then
@@ -393,7 +412,7 @@ jobs:
 
       - name: Fix Java and Namespace
         run: |
-          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpyService.java"
+          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpService.java"
           if [ -f "$FILE_PATH" ]; then
             sed -i '/import com.nullx.pp.R;/d' "$FILE_PATH"
             echo "✅ Import R dihapus"
@@ -757,9 +776,10 @@ jobs:
       - name: 🗜️ Optimize Assets (kecilkan ukuran APK)
         if: steps.build_info.outputs.build_type != 'apk-debug'
         continue-on-error: true
+        timeout-minutes: 5
         run: |
           echo "=== OPTIMIZE ASSETS ==="
-          sudo apt-get install -y -qq optipng jpegoptim >/dev/null 2>&1 || echo "⚠️ optipng/jpegoptim gagal dipasang, dilewati"
+          sudo timeout 90 apt-get install -y -qq optipng jpegoptim >/dev/null 2>&1 || echo "⚠️ optipng/jpegoptim gagal dipasang, dilewati"
           DIRS=""
           for d in assets android/app/src/main/res; do [ -d "$d" ] && DIRS="$DIRS $d"; done
           if [ -n "$DIRS" ]; then
