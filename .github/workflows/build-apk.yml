@@ -195,98 +195,30 @@ jobs:
       # 🎨 REGENERATE LAUNCHER ICONS (FIX UTAMA)
       # ============================================
       - name: 🎨 Regenerate Launcher Icons
+        continue-on-error: true
         run: |
-          echo "=========================================="
-          echo "=== REGENERATING LAUNCHER ICONS ==="
-          echo "=========================================="
+          SOURCE_ICON=""
+          for f in assets/icon/icon.jpg assets/icon/icon.png assets/icon/icon.webp; do
+            [ -f "$f" ] && SOURCE_ICON="$f" && break
+          done
+
+          if [ -z "$SOURCE_ICON" ]; then
+            echo "ℹ️ Tidak ada assets/icon/icon.*, pakai icon bawaan project"
+            exit 0
+          fi
 
           if ! command -v convert >/dev/null 2>&1; then
-            echo "📦 Installing ImageMagick..."
-            sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq imagemagick || { echo "⚠️ imagemagick gagal, skip"; exit 0; }
           fi
 
-          SOURCE_ICON=""
-          if [ -f "assets/icon/icon.jpg" ]; then
-            SOURCE_ICON="assets/icon/icon.jpg"
-          elif [ -f "assets/icon/icon.png" ]; then
-            SOURCE_ICON="assets/icon/icon.png"
-          elif [ -f "assets/icon/icon.webp" ]; then
-            SOURCE_ICON="assets/icon/icon.webp"
-          fi
-
-          if [ -n "$SOURCE_ICON" ]; then
-            echo "✅ Source icon found: $SOURCE_ICON"
-
-            echo "🗑️ Removing all existing ic_launcher files..."
-            find android/app/src/main/res -name "ic_launcher*" -type f -delete
-
-            echo "🎨 Creating icons for all densities..."
-
-            mkdir -p android/app/src/main/res/mipmap-mdpi
-            convert "$SOURCE_ICON" -resize 48x48 -gravity center -extent 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-            echo "  ✅ mipmap-mdpi/ic_launcher.png (48x48)"
-
-            mkdir -p android/app/src/main/res/mipmap-hdpi
-            convert "$SOURCE_ICON" -resize 72x72 -gravity center -extent 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
-            echo "  ✅ mipmap-hdpi/ic_launcher.png (72x72)"
-
-            mkdir -p android/app/src/main/res/mipmap-xhdpi
-            convert "$SOURCE_ICON" -resize 96x96 -gravity center -extent 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-            echo "  ✅ mipmap-xhdpi/ic_launcher.png (96x96)"
-
-            mkdir -p android/app/src/main/res/mipmap-xxhdpi
-            convert "$SOURCE_ICON" -resize 144x144 -gravity center -extent 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-            echo "  ✅ mipmap-xxhdpi/ic_launcher.png (144x144)"
-
-            mkdir -p android/app/src/main/res/mipmap-xxxhdpi
-            convert "$SOURCE_ICON" -resize 192x192 -gravity center -extent 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-            echo "  ✅ mipmap-xxxhdpi/ic_launcher.png (192x192)"
-
-            echo "🎨 Creating adaptive icon (Android 8+)..."
-            mkdir -p android/app/src/main/res/mipmap-anydpi-v26
-
-            mkdir -p android/app/src/main/res/drawable
-            convert "$SOURCE_ICON" -resize 108x108 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_background.png
-
-            convert "$SOURCE_ICON" -resize 72x72 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png
-
-            cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml << 'XMLEOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@mipmap/ic_launcher_background"/>
-              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-          </adaptive-icon>
-          XMLEOF
-            echo "  ✅ mipmap-anydpi-v26/ic_launcher.xml"
-
-          else
-            echo "⚠️ No source icon found, creating placeholder icons..."
-
-            for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
-              case $density in
-                mdpi) SIZE="48x48" ;;
-                hdpi) SIZE="72x72" ;;
-                xhdpi) SIZE="96x96" ;;
-                xxhdpi) SIZE="144x144" ;;
-                xxxhdpi) SIZE="192x192" ;;
-              esac
-
-              OUTPUT_DIR="android/app/src/main/res/mipmap-${density}"
-              mkdir -p "$OUTPUT_DIR"
-
-              convert -size "$SIZE" xc:'#2196F3' \
-                -fill white -gravity center -pointsize 24 \
-                -annotate 0 "App" \
-                "$OUTPUT_DIR/ic_launcher.png"
-
-              echo "  ✅ Placeholder: mipmap-${density}/ic_launcher.png (${SIZE})"
-            done
-          fi
-
-          echo ""
-          echo "=== ICON REGENERATION COMPLETE ==="
-          echo "Files created:"
-          find android/app/src/main/res -name "ic_launcher*" -type f | sort
+          find android/app/src/main/res -name "ic_launcher*" -type f -delete
+          for d in "mdpi 48" "hdpi 72" "xhdpi 96" "xxhdpi 144" "xxxhdpi 192"; do
+            set -- $d
+            mkdir -p android/app/src/main/res/mipmap-$1
+            convert "$SOURCE_ICON" -resize ${2}x${2} -gravity center -extent ${2}x${2} \
+              android/app/src/main/res/mipmap-$1/ic_launcher.png
+          done
 
       # ============================================
       # 🧹 CLEAN ICON RESOURCES (bersihkan duplikat)
