@@ -109,7 +109,8 @@ jobs:
           flutter create --org com.celestial.web2apk --project-name "w2a_${APP_SLUG}" \
             --platforms android --empty app
           cd app
-          flutter pub add webview_flutter url_launcher
+          # versi dipatok yang cocok dengan Flutter 3.24; kalau gagal baru pakai versi terbaru yang kompatibel
+          flutter pub add webview_flutter:4.9.0 url_launcher:6.3.0 || flutter pub add webview_flutter url_launcher
           mkdir -p assets/www
           echo "placeholder" > assets/www/.keep
           cp ../payload/config.json assets/app_config.json
@@ -215,7 +216,7 @@ jobs:
             Widget build(BuildContext context) {
               return PopScope(
                 canPop: false,
-                onPopInvoked: (didPop) async {
+                onPopInvokedWithResult: (didPop, result) async {
                   if (didPop) return;
                   if (await _c.canGoBack()) {
                     await _c.goBack();
@@ -258,8 +259,9 @@ jobs:
       - name: Process icon
         run: |
           IM=$(command -v magick || command -v convert)
+          echo "ImageMagick: $IM"
           cd app
-          SRC=$(ls ../payload/icon.* 2>/dev/null | head -1 || true)
+          SRC=$(ls ../payload/icon.* 2>/dev/null | head -n 1 || true)
           OK=0
           if [ -n "$SRC" ]; then
             if $IM "${SRC}[0]" -background none -alpha on -resize 1080x1080^ -gravity center -extent 1080x1080 PNG32:assets/icon.png; then
@@ -269,26 +271,18 @@ jobs:
             fi
           fi
           if [ "$OK" = "0" ]; then
-            FONT=$(fc-list : file 2>/dev/null | grep -i "DejaVuSans-Bold" | head -1 | cut -d: -f1 || true)
             $IM -size 1080x1080 gradient:'#4F46E5-#EC4899' PNG32:assets/icon.png
-            if [ -n "$FONT" ]; then
-              $IM assets/icon.png -font "$FONT" -fill white -gravity center -pointsize 560 -annotate +0+0 "$APP_INITIAL" PNG32:assets/icon.png || true
-            fi
             echo "Ikon default dibuat"
           fi
-          BG=$($IM assets/icon.png -format '#%[hex:p{8,8}]' info: | cut -c1-7)
-          $IM assets/icon.png -resize 720x720 -background none -gravity center -extent 1080x1080 PNG32:assets/icon_fg.png
-          cat > flutter_launcher_icons.yaml <<EOF
-          flutter_launcher_icons:
-            android: true
-            ios: false
-            image_path: "assets/icon.png"
-            adaptive_icon_background: "$BG"
-            adaptive_icon_foreground: "assets/icon_fg.png"
-            min_sdk_android: 21
-          EOF
-          flutter pub add dev:flutter_launcher_icons
-          dart run flutter_launcher_icons || echo "Peringatan: launcher icon gagal dibuat, memakai ikon bawaan Flutter"
+          # ikon launcher Android (langsung, tanpa plugin tambahan)
+          RES=android/app/src/main/res
+          for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            D=${pair%%:*}
+            S=${pair##*:}
+            mkdir -p "$RES/mipmap-$D"
+            $IM assets/icon.png -resize "${S}x${S}" "PNG32:$RES/mipmap-$D/ic_launcher.png"
+          done
+          ls -la "$RES"/mipmap-*/ic_launcher.png
 
       # ------------------------------------------------------------
       - name: Build APK
