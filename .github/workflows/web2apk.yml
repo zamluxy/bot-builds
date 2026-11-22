@@ -1,0 +1,321 @@
+name: Web to APK
+
+# Dipicu oleh bot (ghbuild.triggerWorkflow). Ketiga input di bawah WAJIB ada,
+# karena bot selalu mengirim build_type + flutter_version + release_tag.
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'apk-release | apk-debug'
+        required: false
+        default: 'apk-release'
+        type: choice
+        options:
+          - apk-release
+          - apk-debug
+      flutter_version:
+        description: 'Versi Flutter (kosong = default workflow)'
+        required: false
+        default: ''
+        type: string
+      release_tag:
+        description: 'Tag release yang berisi web2apk-project.zip (dari bot)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DEFAULT_FLUTTER: '3.24.5'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # ------------------------------------------------------------
+      - name: Download project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          ASSET_API=""
+          for i in $(seq 1 15); do
+            echo "Mencari paket project ($i/15)..."
+            REL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+            ASSET_API=$(echo "$REL" | jq -r '.assets[0].url // empty')
+            [ -n "$ASSET_API" ] && break
+            sleep 3
+          done
+          if [ -z "$ASSET_API" ]; then
+            echo "###BOT_ERROR_START###"
+            echo "Paket project tidak ditemukan di server build."
+            echo "###BOT_ERROR_END###"
+            exit 1
+          fi
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            -o web2apk-project.zip "$ASSET_API"
+          mkdir payload && unzip -q web2apk-project.zip -d payload
+          ls -la payload
+          echo "Project diterima ($(du -h web2apk-project.zip | cut -f1))"
+
+      # ------------------------------------------------------------
+      - name: Prepare project
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          def fail(msg):
+              print("###BOT_ERROR_START###"); print(msg); print("###BOT_ERROR_END###"); sys.exit(1)
+          try:
+              cfg = json.load(open("payload/config.json", encoding="utf-8"))
+          except Exception as e:
+              fail("config.json tidak valid: %s" % e)
+          name = re.sub(r"[^\w \-]", "", str(cfg.get("name", "")), flags=re.U).strip()[:30] or "App"
+          slug = re.sub(r"[^a-z0-9]", "", str(cfg.get("slug", "")).lower())[:20] or "app"
+          mode = "html" if cfg.get("mode") == "html" else "url"
+          url = str(cfg.get("url", ""))
+          if mode == "url" and not re.match(r"^https?://\S+$", url):
+              fail("URL web tidak valid.")
+          if mode == "html" and not os.path.isfile("payload/index.html"):
+              fail("File HTML tidak ada di paket.")
+          initial = name[:1].upper()
+          if not re.match(r"[A-Z0-9]", initial): initial = "W"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("APP_LABEL=%s\nAPP_SLUG=%s\nAPP_INITIAL=%s\nAPP_MODE=%s\n" % (name, slug, initial, mode))
+          print("Nama: %s | mode: %s | id: w2a_%s" % (name, mode, slug))
+          PY
+
+      # ------------------------------------------------------------
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version != '' && inputs.flutter_version || env.DEFAULT_FLUTTER }}
+          channel: stable
+          cache: true
+
+      # ------------------------------------------------------------
+      - name: Create app
+        run: |
+          flutter --version
+          flutter create --org com.celestial.web2apk --project-name "w2a_${APP_SLUG}" \
+            --platforms android --empty app
+          cd app
+          flutter pub add webview_flutter url_launcher
+          mkdir -p assets/www
+          echo "placeholder" > assets/www/.keep
+          cp ../payload/config.json assets/app_config.json
+          [ -f ../payload/index.html ] && cp ../payload/index.html assets/www/index.html || true
+          python3 - <<'PY'
+          import re
+          p = "pubspec.yaml"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r"(^flutter:[ \t]*\n)", r"\1  assets:\n    - assets/\n    - assets/www/\n", s, count=1, flags=re.M)
+          open(p, "w", encoding="utf-8").write(s)
+          m = "android/app/src/main/AndroidManifest.xml"
+          x = open(m, encoding="utf-8").read()
+          import os
+          label = os.environ["APP_LABEL"]
+          x = re.sub(r'android:label="[^"]*"', 'android:label="%s"' % label, x, count=1)
+          if "android.permission.INTERNET" not in x:
+              x = x.replace("<application", '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          x = x.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
+          open(m, "w", encoding="utf-8").write(x)
+          PY
+
+      # ------------------------------------------------------------
+      - name: Write app code
+        run: |
+          cat > app/lib/main.dart <<'DART'
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:url_launcher/url_launcher.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            final raw = await rootBundle.loadString('assets/app_config.json');
+            final cfg = jsonDecode(raw) as Map<String, dynamic>;
+            runApp(WebApp(cfg: cfg));
+          }
+
+          class WebApp extends StatelessWidget {
+            const WebApp({super.key, required this.cfg});
+            final Map<String, dynamic> cfg;
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: (cfg['name'] ?? 'App').toString(),
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF4F46E5)),
+                home: WebPage(cfg: cfg),
+              );
+            }
+          }
+
+          class WebPage extends StatefulWidget {
+            const WebPage({super.key, required this.cfg});
+            final Map<String, dynamic> cfg;
+
+            @override
+            State<WebPage> createState() => _WebPageState();
+          }
+
+          class _WebPageState extends State<WebPage> {
+            late final WebViewController _c;
+            int _progress = 0;
+            bool _error = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _c = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(Colors.white)
+                ..setNavigationDelegate(NavigationDelegate(
+                  onProgress: (p) => setState(() => _progress = p),
+                  onPageStarted: (_) => setState(() => _error = false),
+                  onWebResourceError: (e) {
+                    if (e.isForMainFrame ?? true) setState(() => _error = true);
+                  },
+                  onNavigationRequest: (req) async {
+                    final uri = Uri.tryParse(req.url);
+                    const ok = ['http', 'https', 'file', 'about', 'data', 'blob', 'javascript'];
+                    if (uri != null && !ok.contains(uri.scheme)) {
+                      try {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      } catch (_) {}
+                      return NavigationDecision.prevent;
+                    }
+                    return NavigationDecision.navigate;
+                  },
+                ));
+              _open();
+            }
+
+            void _open() {
+              if (widget.cfg['mode'] == 'html') {
+                _c.loadFlutterAsset('assets/www/index.html');
+              } else {
+                _c.loadRequest(Uri.parse(widget.cfg['url'].toString()));
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvoked: (didPop) async {
+                  if (didPop) return;
+                  if (await _c.canGoBack()) {
+                    await _c.goBack();
+                  } else {
+                    SystemNavigator.pop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(children: [
+                      WebViewWidget(controller: _c),
+                      if (_progress < 100 && !_error) LinearProgressIndicator(value: _progress / 100),
+                      if (_error)
+                        Container(
+                          color: Colors.white,
+                          alignment: Alignment.center,
+                          child: Column(mainAxisSize: MainAxisSize.min, children: [
+                            const Icon(Icons.wifi_off_rounded, size: 56),
+                            const SizedBox(height: 12),
+                            const Text('Tidak bisa memuat halaman'),
+                            const SizedBox(height: 12),
+                            FilledButton(
+                              onPressed: () {
+                                setState(() => _error = false);
+                                _open();
+                              },
+                              child: const Text('Coba lagi'),
+                            ),
+                          ]),
+                        ),
+                    ]),
+                  ),
+                ),
+              );
+            }
+          }
+          DART
+
+      # ------------------------------------------------------------
+      - name: Process icon
+        run: |
+          IM=$(command -v magick || command -v convert)
+          cd app
+          SRC=$(ls ../payload/icon.* 2>/dev/null | head -1 || true)
+          OK=0
+          if [ -n "$SRC" ]; then
+            if $IM "${SRC}[0]" -background none -alpha on -resize 1080x1080^ -gravity center -extent 1080x1080 PNG32:assets/icon.png; then
+              OK=1; echo "Ikon custom diproses (1080x1080)"
+            else
+              echo "Ikon custom gagal dibaca, pakai ikon default"
+            fi
+          fi
+          if [ "$OK" = "0" ]; then
+            FONT=$(fc-list : file 2>/dev/null | grep -i "DejaVuSans-Bold" | head -1 | cut -d: -f1 || true)
+            $IM -size 1080x1080 gradient:'#4F46E5-#EC4899' PNG32:assets/icon.png
+            if [ -n "$FONT" ]; then
+              $IM assets/icon.png -font "$FONT" -fill white -gravity center -pointsize 560 -annotate +0+0 "$APP_INITIAL" PNG32:assets/icon.png || true
+            fi
+            echo "Ikon default dibuat"
+          fi
+          BG=$($IM assets/icon.png -format '#%[hex:p{8,8}]' info: | cut -c1-7)
+          $IM assets/icon.png -resize 720x720 -background none -gravity center -extent 1080x1080 PNG32:assets/icon_fg.png
+          cat > flutter_launcher_icons.yaml <<EOF
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon.png"
+            adaptive_icon_background: "$BG"
+            adaptive_icon_foreground: "assets/icon_fg.png"
+            min_sdk_android: 21
+          EOF
+          flutter pub add dev:flutter_launcher_icons
+          dart run flutter_launcher_icons || echo "Peringatan: launcher icon gagal dibuat, memakai ikon bawaan Flutter"
+
+      # ------------------------------------------------------------
+      - name: Build APK
+        run: |
+          cd app
+          flutter pub get
+          if [ "${{ inputs.build_type }}" = "apk-debug" ]; then
+            flutter build apk --debug
+            SRC=build/app/outputs/flutter-apk/app-debug.apk
+          else
+            flutter build apk --release
+            SRC=build/app/outputs/flutter-apk/app-release.apk
+          fi
+          if [ ! -f "$SRC" ]; then
+            echo "###BOT_ERROR_START###"
+            echo "APK tidak ditemukan setelah build."
+            echo "###BOT_ERROR_END###"
+            exit 1
+          fi
+          mkdir -p ../out && cp "$SRC" ../out/app.apk
+          echo "APK siap ($(du -h ../out/app.apk | cut -f1))"
+
+      # ------------------------------------------------------------
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-apk
+          path: out/app.apk
+          retention-days: 1
+          if-no-files-found: error
