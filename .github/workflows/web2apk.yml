@@ -258,31 +258,51 @@ jobs:
       # ------------------------------------------------------------
       - name: Process icon
         run: |
-          IM=$(command -v magick || command -v convert)
-          echo "ImageMagick: $IM"
-          cd app
-          SRC=$(ls ../payload/icon.* 2>/dev/null | head -n 1 || true)
-          OK=0
-          if [ -n "$SRC" ]; then
-            if $IM "${SRC}[0]" -background none -alpha on -resize 1080x1080^ -gravity center -extent 1080x1080 PNG32:assets/icon.png; then
-              OK=1; echo "Ikon custom diproses (1080x1080)"
-            else
-              echo "Ikon custom gagal dibaca, pakai ikon default"
-            fi
+          # ImageMagick TIDAK ada di runner ubuntu-24.04 → pakai Pillow (Python)
+          if ! python3 -c "import PIL" 2>/dev/null; then
+            echo "Memasang Pillow..."
+            python3 -m pip install --quiet --break-system-packages pillow \
+              || python3 -m pip install --quiet pillow \
+              || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-pil; }
           fi
-          if [ "$OK" = "0" ]; then
-            $IM -size 1080x1080 gradient:'#4F46E5-#EC4899' PNG32:assets/icon.png
-            echo "Ikon default dibuat"
-          fi
-          # ikon launcher Android (langsung, tanpa plugin tambahan)
-          RES=android/app/src/main/res
-          for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-            D=${pair%%:*}
-            S=${pair##*:}
-            mkdir -p "$RES/mipmap-$D"
-            $IM assets/icon.png -resize "${S}x${S}" "PNG32:$RES/mipmap-$D/ic_launcher.png"
-          done
-          ls -la "$RES"/mipmap-*/ic_launcher.png
+          python3 - <<'PY'
+          import glob, os, sys
+          from PIL import Image
+          os.chdir("app")
+          os.makedirs("assets", exist_ok=True)
+
+          def default_icon(initial):
+              img = Image.new("RGB", (1080, 1080))
+              a, b = (79, 70, 229), (236, 72, 153)
+              img.putdata([tuple(int(a[i] + (b[i] - a[i]) * (x + y) / 2158) for i in range(3))
+                           for y in range(1080) for x in range(1080)])
+              return img.convert("RGBA")
+
+          icon = None
+          srcs = sorted(glob.glob("../payload/icon.*"))
+          if srcs:
+              try:
+                  im = Image.open(srcs[0])
+                  im.seek(0)
+                  im = im.convert("RGBA")
+                  w, h = im.size
+                  s = min(w, h)
+                  l, t = (w - s) // 2, (h - s) // 2
+                  icon = im.crop((l, t, l + s, t + s)).resize((1080, 1080), Image.LANCZOS)
+                  print("Ikon custom diproses: %dx%d -> 1080x1080 (crop tengah 1:1)" % (w, h))
+              except Exception as e:
+                  print("Ikon custom gagal dibaca (%s), memakai ikon default" % e)
+          if icon is None:
+              icon = default_icon(os.environ.get("APP_INITIAL", "W"))
+              print("Ikon default dipakai")
+          icon.save("assets/icon.png")
+
+          res = "android/app/src/main/res"
+          for d, px in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+              os.makedirs("%s/mipmap-%s" % (res, d), exist_ok=True)
+              icon.resize((px, px), Image.LANCZOS).save("%s/mipmap-%s/ic_launcher.png" % (res, d))
+              print("ic_launcher %s %dx%d" % (d, px, px))
+          PY
 
       # ------------------------------------------------------------
       - name: Build APK
