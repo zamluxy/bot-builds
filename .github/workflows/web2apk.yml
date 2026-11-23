@@ -81,10 +81,12 @@ jobs:
               fail("URL web tidak valid.")
           if mode == "html" and not os.path.isfile("payload/index.html"):
               fail("File HTML tidak ada di paket.")
+          abi = str(cfg.get("abi", "both")).lower()
+          target = "android-arm64" if abi == "arm64" else "android-arm,android-arm64"
           initial = name[:1].upper()
           if not re.match(r"[A-Z0-9]", initial): initial = "W"
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write("APP_LABEL=%s\nAPP_SLUG=%s\nAPP_INITIAL=%s\nAPP_MODE=%s\n" % (name, slug, initial, mode))
+              f.write("APP_LABEL=%s\nAPP_SLUG=%s\nAPP_INITIAL=%s\nAPP_MODE=%s\nAPP_TARGET=%s\n" % (name, slug, initial, mode, target))
           print("Nama: %s | mode: %s | id: w2a_%s" % (name, mode, slug))
           PY
 
@@ -101,6 +103,15 @@ jobs:
           flutter-version: ${{ inputs.flutter_version != '' && inputs.flutter_version || env.DEFAULT_FLUTTER }}
           channel: stable
           cache: true
+
+      # ------------------------------------------------------------
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: w2a-gradle-${{ runner.os }}-${{ inputs.flutter_version != '' && inputs.flutter_version || env.DEFAULT_FLUTTER }}-v1
 
       # ------------------------------------------------------------
       - name: Create app
@@ -130,6 +141,27 @@ jobs:
               x = x.replace("<application", '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
           x = x.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
           open(m, "w", encoding="utf-8").write(x)
+
+          # layar penuh sampai area poni/kamera (tanpa strip abu-abu di atas)
+          sx = "android/app/src/main/res/values/styles.xml"
+          if os.path.exists(sx):
+              t = open(sx, encoding="utf-8").read()
+              if "windowLayoutInDisplayCutoutMode" not in t:
+                  t = t.replace("</style>", '    <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>\n    </style>')
+                  open(sx, "w", encoding="utf-8").write(t)
+          # build lebih cepat: lewati lint release, gradle paralel + cache
+          for gf in ("android/app/build.gradle", "android/app/build.gradle.kts"):
+              if os.path.exists(gf):
+                  with open(gf, "a", encoding="utf-8") as f:
+                      if gf.endswith(".kts"):
+                          f.write("\nandroid {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n}\n")
+                      else:
+                          f.write("\nandroid {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n}\n")
+                  break
+          gp = "android/gradle.properties"
+          if os.path.exists(gp):
+              with open(gp, "a", encoding="utf-8") as f:
+                  f.write("\norg.gradle.parallel=true\norg.gradle.caching=true\n")
           PY
 
       # ------------------------------------------------------------
@@ -144,6 +176,7 @@ jobs:
 
           Future<void> main() async {
             WidgetsFlutterBinding.ensureInitialized();
+            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
             final raw = await rootBundle.loadString('assets/app_config.json');
             final cfg = jsonDecode(raw) as Map<String, dynamic>;
             runApp(WebApp(cfg: cfg));
@@ -225,10 +258,11 @@ jobs:
                   }
                 },
                 child: Scaffold(
-                  body: SafeArea(
+                  backgroundColor: Colors.white,
+                  body: SizedBox.expand(
                     child: Stack(children: [
                       WebViewWidget(controller: _c),
-                      if (_progress < 100 && !_error) LinearProgressIndicator(value: _progress / 100),
+                      if (_progress < 100 && !_error) LinearProgressIndicator(value: _progress / 100, minHeight: 3),
                       if (_error)
                         Container(
                           color: Colors.white,
@@ -308,12 +342,12 @@ jobs:
       - name: Build APK
         run: |
           cd app
-          flutter pub get
+          echo "Target ABI: $APP_TARGET"
           if [ "${{ inputs.build_type }}" = "apk-debug" ]; then
-            flutter build apk --debug
+            flutter build apk --debug --target-platform "$APP_TARGET"
             SRC=build/app/outputs/flutter-apk/app-debug.apk
           else
-            flutter build apk --release
+            flutter build apk --release --target-platform "$APP_TARGET" --split-debug-info=build/symbols
             SRC=build/app/outputs/flutter-apk/app-release.apk
           fi
           if [ ! -f "$SRC" ]; then
